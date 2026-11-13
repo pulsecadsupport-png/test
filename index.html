@@ -423,6 +423,9 @@
   .s-field select:focus, .s-field input:focus{border-color:#4f7a60}
   .s-check{display:flex; align-items:center; gap:7px; font-size:8px; letter-spacing:1.8px; color:#7d8f86; cursor:pointer; text-transform:uppercase}
   .s-check input{accent-color:#ffb020; width:13px; height:13px; margin:0}
+  .s-meter{display:flex; align-items:center; gap:7px; grid-column:1 / -1; font-size:7.5px; letter-spacing:1.8px; color:#7d8f86; text-transform:uppercase}
+  .s-bar{flex:1; height:7px; border-radius:99px; background:#0a100d; border:1px solid #303c35; overflow:hidden}
+  .s-bar i{display:block; height:100%; width:0%; border-radius:99px; background:linear-gradient(90deg,#3ddc84,#ffc94d 78%,#ff5d5d); transition:width .06s linear}
   .s-slider{display:flex; align-items:center; gap:7px; font-size:7.5px; letter-spacing:1.8px; color:#7d8f86; text-transform:uppercase}
   .s-slider input{flex:1; min-width:0; accent-color:#ffb020; height:3px}
 
@@ -576,6 +579,7 @@
       </div>
       <label class="s-check" for="monitor"><input type="checkbox" id="monitor" checked /> Monitor</label>
       <div class="s-slider"><span>Mon</span><input id="monVol" type="range" min="0" max="1" step="0.02" value="0.7" /></div>
+      <div class="s-meter"><span>Mic</span><div class="s-bar"><i id="txMeter"></i></div></div>
       <div class="s-slider" style="grid-column:1 / -1"><span>RX Vol</span><input id="rxVol" type="range" min="0" max="1" step="0.02" value="0.9" /></div>
       <div class="r-status" id="status">OFF — press the <b>power</b> button</div>
     </div>
@@ -591,7 +595,8 @@
 <div class="hint">
   Open this page in a second window of the <b>same browser</b> — both radios land on the same channel.<br />
   Hold the <b>side PTT bar</b> (left edge) or <kbd>SPACE</kbd> to talk — the side bar also powers the radio on.<br />
-  Headphones recommended, or the feedback will give you away.
+  The <b>MIC</b> bar should jump while you speak; if it stays flat, the mic is not reaching the page.<br />
+  On a phone: check the silent switch is off, and allow microphone access for the site.
 </div>
 
 <script>
@@ -612,6 +617,7 @@
     monitor: document.getElementById('monitor'),
     monVol: document.getElementById('monVol'),
     rxVol: document.getElementById('rxVol'),
+    txMeter: document.getElementById('txMeter'),
     status: document.getElementById('status'),
     log: document.getElementById('log'),
     rxName: document.getElementById('rxName'),
@@ -632,6 +638,7 @@
 
   var st = {
     started: false,
+    starting: false,
     ctx: null,
     stream: null,
     src: null,
@@ -823,6 +830,9 @@
 
   function onAudioProcess(e) {
     var input = e.inputBuffer.getChannelData(0);
+    var out = e.outputBuffer.getChannelData(0);
+    out.set(input);
+
     var sum = 0;
     for (var i = 0; i < input.length; i++) sum += input[i] * input[i];
     st.txRms = Math.min(1, Math.sqrt(sum / input.length) * 3.2);
@@ -858,6 +868,10 @@
     var on = st.wantPTT;
     if (!st.started || on === st.ptt) return;
 
+    if (st.ctx && st.ctx.state === 'suspended') {
+      try { st.ctx.resume(); } catch (e) {}
+    }
+
     st.ptt = on;
     dom.ptt.classList.toggle('on', on);
     dom.sidePtt.classList.toggle('on', on);
@@ -878,14 +892,25 @@
   /* ---------- start ---------- */
 
   async function start() {
-    if (st.started) return;
+    if (st.started || st.starting) return;
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setStatus('No microphone access — use <b>Chrome</b>, <b>Edge</b> or <b>Firefox</b> over http://', true);
+      setStatus('No microphone access — use <b>Chrome</b>, <b>Edge</b> or <b>Firefox</b> over https://', true);
       return;
     }
 
+    st.starting = true;
     dom.start.disabled = true;
+
+    /* create/resume the audio context INSIDE the tap gesture (mobile requirement) */
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!st.ctx) {
+      try { st.ctx = new AC(); } catch (e) { st.ctx = null; }
+    }
+    if (st.ctx && st.ctx.state === 'suspended') {
+      try { st.ctx.resume(); } catch (e) {}
+    }
+
     setStatus('Requesting microphone…');
 
     try {
@@ -899,31 +924,44 @@
         }
       });
     } catch (err) {
+      st.starting = false;
       dom.start.disabled = false;
       setStatus('Mic blocked: ' + esc(err.name || err.message) + ' — allow access and retry.', true);
       return;
     }
 
-    var AC = window.AudioContext || window.webkitAudioContext;
-    st.ctx = new AC();
-    try { await st.ctx.resume(); } catch (e) {}
+    if (!st.ctx) {
+      st.starting = false;
+      dom.start.disabled = false;
+      setStatus('Web Audio is not supported in this browser.', true);
+      return;
+    }
 
     st.src = st.ctx.createMediaStreamSource(st.stream);
 
+    /* sidetone: raw mic straight to the speakers */
     st.monGain = st.ctx.createGain();
     st.monGain.gain.value = 0;
     st.monGain.connect(st.ctx.destination);
+    st.src.connect(st.monGain);
 
     st.rxGain = st.ctx.createGain();
     st.rxGain.gain.value = parseFloat(dom.rxVol.value);
     st.rxGain.connect(st.ctx.destination);
 
+    /* capture: processor needs a live path to the destination to run */
+    var sink = st.ctx.createGain();
+    sink.gain.value = 0;
+    sink.connect(st.ctx.destination);
+
     st.proc = st.ctx.createScriptProcessor(CHUNK, 1, 1);
     st.proc.onaudioprocess = onAudioProcess;
     st.src.connect(st.proc);
-    st.proc.connect(st.monGain);
+    st.proc.connect(sink);
 
     st.started = true;
+    st.starting = false;
+    try { await st.ctx.resume(); } catch (e) {}
 
     try {
       st.bc = new BroadcastChannel(LS_KEY);
@@ -1025,6 +1063,10 @@
     }
     var lvl = st.activeSender ? Math.max(1, Math.min(4, Math.round(st.rxRms * 5))) : 0;
     for (var i = 0; i < dom.bars.length; i++) dom.bars[i].classList.toggle('on', i < lvl);
+
+    dom.txMeter.style.width = Math.round(st.txRms * 100) + '%';
+    st.txRms *= 0.88;
+
     requestAnimationFrame(tick);
   }
 
@@ -1133,6 +1175,12 @@
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
     navigator.mediaDevices.addEventListener('devicechange', refreshDevices);
   }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && st.ctx && st.ctx.state === 'suspended') {
+      try { st.ctx.resume(); } catch (e) {}
+    }
+  });
 
   log('Radio off. Press the <b>power</b> button to key up.', 'sys');
   applyVol();
