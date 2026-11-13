@@ -586,17 +586,17 @@
 
     <div class="console-foot">
       <div class="rx-ind"><span id="rxFlag" class="flag"></span><span id="rxName">no signal</span></div>
-      <div>2 WINDOWS = 2 RADIOS</div>
+      <div>SAME CHANNEL = SAME NET</div>
     </div>
   </aside>
 
 </div>
 
 <div class="hint">
-  Open this page in a second window of the <b>same browser</b> — both radios land on the same channel.<br />
+  Open this page on two devices at the <b>same address</b> (phone + computer both on <b>CH 01</b>) and you can hear each other.<br />
   Hold the <b>side PTT bar</b> (left edge) or <kbd>SPACE</kbd> to talk — the side bar also powers the radio on.<br />
   The <b>MIC</b> bar should jump while you speak; if it stays flat, the mic is not reaching the page.<br />
-  On a phone: check the silent switch is off, and allow microphone access for the site.
+  Phone: silent switch off, microphone allowed. If the relay is missing, the log says <i>same-browser only</i> — start <kbd>node server.js</kbd>.
 </div>
 
 <script>
@@ -655,6 +655,8 @@
     rxRms: 0,
     bc: null,
     useLocal: false,
+    net: 'none',
+    es: null,
     lastRxAt: 0
   };
 
@@ -732,6 +734,7 @@
   /* ---------- transport ---------- */
 
   function send(msg) {
+    if (st.net === 'server') { postNet(msg); return; }
     if (st.bc) {
       try { st.bc.postMessage(msg); return; } catch (e) { /* fall through */ }
     }
@@ -740,6 +743,66 @@
         localStorage.setItem(LS_KEY, JSON.stringify(msg) + '#' + Math.random());
       } catch (e) { /* storage full / blocked */ }
     }
+  }
+
+  /* send over the relay (server.js) — audio is base64 because it is JSON */
+  function postNet(msg) {
+    var out = {};
+    for (var k in msg) {
+      if (Object.prototype.hasOwnProperty.call(msg, k)) out[k] = msg[k];
+    }
+    if (out.d) { out.b = f32ToB64(out.d); delete out.d; }
+
+    var body;
+    try { body = JSON.stringify(out); } catch (e) { return; }
+
+    try {
+      fetch('send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: body,
+        keepalive: true
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  /* connect to the relay if one is reachable, else resolve false */
+  function openServer() {
+    return new Promise(function (resolve) {
+      var es;
+      try { es = new EventSource('events'); } catch (e) { resolve(false); return; }
+
+      var settled = false;
+      var timer = setTimeout(function () { finish(false); }, 3500);
+
+      function finish(ok) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (!ok) { try { es.close(); } catch (e) {} }
+        resolve(ok);
+      }
+
+      es.onopen = function () {
+        if (settled) {
+          /* reconnected after a drop: make sure we are still listening */
+          if (!es.onmessage) {
+            es.onmessage = function (ev) {
+              try { handleMessage(JSON.parse(ev.data)); } catch (e) {}
+            };
+          }
+          return;
+        }
+        st.es = es;
+        st.net = 'server';
+        es.onmessage = function (ev) {
+          try { handleMessage(JSON.parse(ev.data)); } catch (e) {}
+        };
+        finish(true);
+      };
+
+      es.onerror = function () { if (!settled) finish(false); };
+    });
   }
 
   function handleMessage(msg) {
@@ -963,21 +1026,26 @@
     st.starting = false;
     try { await st.ctx.resume(); } catch (e) {}
 
-    try {
-      st.bc = new BroadcastChannel(LS_KEY);
-      st.useLocal = false;
-    } catch (e) {
-      st.bc = null;
-    }
+    var linked = await openServer();
 
-    if (st.bc) {
-      st.bc.onmessage = function (ev) { handleMessage(ev.data); };
+    if (linked) {
+      log('Linked to radio relay — other devices can hear you', 'sys');
     } else {
-      st.useLocal = true;
-      window.addEventListener('storage', function (ev) {
-        if (ev.key !== LS_KEY || !ev.newValue) return;
-        try { handleMessage(JSON.parse(ev.newValue.split('#')[0])); } catch (e) {}
-      });
+      st.net = 'none';
+      try {
+        st.bc = new BroadcastChannel(LS_KEY);
+        st.net = 'bc';
+        st.bc.onmessage = function (ev) { handleMessage(ev.data); };
+        log('No relay found — same-browser windows only', 'sys');
+      } catch (e) {
+        st.bc = null;
+        st.useLocal = true;
+        window.addEventListener('storage', function (ev) {
+          if (ev.key !== LS_KEY || !ev.newValue) return;
+          try { handleMessage(JSON.parse(ev.newValue.split('#')[0])); } catch (e) {}
+        });
+        log('No relay found — same-browser tabs only', 'sys');
+      }
     }
 
     dom.ptt.disabled = false;
